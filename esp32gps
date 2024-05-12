@@ -2,6 +2,8 @@
 #include <SPI.h>
 #include <SD.h>
 #include <TinyGPS++.h>
+#include <time.h>
+#include <ArduinoJson.h>
 
 TinyGPSPlus gps;
 File myFile;
@@ -34,7 +36,7 @@ void setup()
   Serial.println("SD card initialized.");
   
   // Wait for valid GPS data
-  while (!gps.location.isValid())
+  while (!gps.location.isValid() || !gps.date.isValid() || !gps.time.isValid())
   {
     while (Serial2.available() > 0)
     {
@@ -45,21 +47,31 @@ void setup()
     }
   }
   
-  // Adjust GPS timestamp to Tokyo time (UTC+9)
-  int hour = gps.time.hour() + 9;
-  int day = gps.date.day();
-  if (hour >= 24)
-  {
-    hour -= 24;
-    day++;
-  }
+  // Set the ESP32's internal RTC using GPS time
+  struct tm timeinfo;
+  timeinfo.tm_year = gps.date.year() - 1900;
+  timeinfo.tm_mon = gps.date.month() - 1;
+  timeinfo.tm_mday = gps.date.day();
+  timeinfo.tm_hour = gps.time.hour();
+  timeinfo.tm_min = gps.time.minute();
+  timeinfo.tm_sec = gps.time.second();
+  time_t gps_time = mktime(&timeinfo);
   
-  // Generate a unique filename based on the corrected Tokyo time
-  String filename = "/GPS_Data_" + String(gps.date.year()) + "_" +
-                    String(gps.date.month()) + "_" + String(day) + "_" +
-                    String(hour) + "_" + String(gps.time.minute()) + "_" +
-                    String(gps.time.second()) + ".txt";
+  // Set the time zone offset for Tokyo (UTC+9)
+  setenv("TZ", "JST-9", 1);
+  tzset();
   
+  // Set the ESP32's internal RTC
+  timeval tv = { gps_time, 0 };
+  settimeofday(&tv, nullptr);
+  
+  // Get the current time
+  time_t now = time(nullptr);
+  struct tm* timeinfo_now = localtime(&now);
+  
+  // Generate a unique filename based on the current time
+  char filename[32];
+  strftime(filename, sizeof(filename), "/GPS_Data_%Y_%m_%d_%H_%M_%S.txt", timeinfo_now);
   myFile = SD.open(filename, FILE_WRITE);
   
   if (!myFile)
@@ -95,42 +107,32 @@ void loop()
           {
             double averageSpeed = (speedCount > 0) ? speedSum / speedCount : 0;
             
-            // Adjust GPS timestamp to Tokyo time (UTC+9)
-            int hour = gps.time.hour() + 9;
-            int day = gps.date.day();
-            if (hour >= 24)
-            {
-              hour -= 24;
-              day++;
-            }
+            // Get the current time
+            time_t now = time(nullptr);
+            struct tm* timeinfo = localtime(&now);
             
-            String dataString = "Timestamp: ";
-            dataString += String(gps.date.month());
-            dataString += "/";
-            dataString += String(day);
-            dataString += " ";
-            dataString += String(hour);
-            dataString += ":";
-            dataString += String(gps.time.minute());
-            dataString += ":";
-            dataString += String(gps.time.second());
-            dataString += "\r\nLatitude: ";
-            dataString += String(gps.location.lat(), 6);
-            dataString += "\r\nLongitude: ";
-            dataString += String(gps.location.lng(), 6);
-            dataString += "\r\nAltitude: ";
-            dataString += String(gps.altitude.meters());
-            dataString += " meters";
-            dataString += "\r\nAverage Speed (3s): ";
-            dataString += String(averageSpeed, 2);
-            dataString += " km/h\r\n";
+            char timestamp[20];
+            strftime(timestamp, sizeof(timestamp), "%m/%d %H:%M:%S", timeinfo);
             
-            myFile.print(dataString);
-            myFile.flush(); // Ensure data is written to the file
+            // Create a JSON object
+            StaticJsonDocument<256> doc;
+            doc["Timestamp"] = timestamp;
+            doc["Latitude"] = gps.location.lat();
+            doc["Longitude"] = gps.location.lng();
+            doc["Altitude"] = gps.altitude.meters();
+            doc["Average Speed (3s)"] = averageSpeed;
             
-            bytesWritten += dataString.length();
+            // Serialize the JSON object to a string
+            String jsonString;
+            serializeJson(doc, jsonString);
             
-            Serial.print(dataString);
+            // Write the JSON string to the file
+            myFile.println(jsonString);
+            myFile.flush();
+            
+            bytesWritten += jsonString.length();
+            
+            Serial.println(jsonString);
             
             speedSum = 0;
             speedCount = 0;
